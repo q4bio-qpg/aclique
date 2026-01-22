@@ -1,5 +1,5 @@
 // TODO: switch to a bit-vector for clique
-// TODO: Fix repeated identical hashes for e.g. gen400_p0.9_75.clq
+// TODO: implement filter_nodes, good for sparse data
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -7,8 +7,22 @@
 #include <inttypes.h>
 #include <time.h>
 #include <math.h>
+#include <assert.h>
 
 #define MAX_CLIQUE 4000
+
+//#define BAIL_OUT
+#ifndef BO_TGROWTH    // Max no. of iterations without finding bigger clique
+#  define BO_TGROWTH  50000
+#endif
+#ifndef BO_TMEMBER    // Max consecutive rep of prior-found clique && TGROWTH
+#  define BO_TMEMBER  500
+#endif
+#ifndef BO_TMEMBER2   // Max rep of prior-found clique, regardless of TGROWTH
+#  define BO_TMEMBER2 50000
+#endif
+
+#define MAX_BEST 1024
 
 //#define POPULATION 256
 //#define NITER 10000
@@ -16,7 +30,7 @@
 #define MAX_POPULATION 1024
 
 #ifndef POPULATION
-#    define POPULATION 32
+#    define POPULATION 96
 #endif
 
 #ifndef NITER
@@ -24,7 +38,7 @@
 #endif
 
 #ifndef AGGRATE
-#    define AGGRATE 0.01
+#    define AGGRATE 0.2
 #endif
 
 //#define POPULATION 512
@@ -46,12 +60,18 @@ static uint8_t bhash[1<<HSIZE] = {0};
 
 typedef struct {
     int i1, i2;
-} pair;
+} ac_pair;
 
 int pair_cmp(const void *vp1, const void *vp2) {
-    const pair *p1 = (const pair *)vp1;
-    const pair *p2 = (const pair *)vp2;
+    const ac_pair *p1 = (const ac_pair *)vp1;
+    const ac_pair *p2 = (const ac_pair *)vp2;
     return p2->i2 - p1->i2;
+}
+
+int pair_cmp_rev(const void *vp1, const void *vp2) {
+    const ac_pair *p1 = (const ac_pair *)vp1;
+    const ac_pair *p2 = (const ac_pair *)vp2;
+    return p1->i2 - p2->i2;
 }
 
 typedef struct {
@@ -62,8 +82,11 @@ typedef struct {
     int *filtered;
     int *degree;
     int random_sz;
-    int *node_map; // for picking nodes biased to degree
+    int *node_map;  // for picking nodes biased to high degree
+    int *node_map2; // for picking nodes biased to low degree
     int degree_order[MAX_CLIQUE];
+    int *neighbour_count;
+    int **neighbour;
 } graph;
 
 typedef struct {
@@ -110,6 +133,7 @@ void add_chash(graph *g, clique *q) {
     chash[q->hash & HMASK]++;
 }
 
+// Returns 0 if the clique is new, otherwise 1.
 int check_chash(graph *g, clique *q) {
     // DIMACS_subset_ascii/gen400_p0.9_55.clq, 256, 10000
     // 0:  43 43 46 46 47 47 47 49 49 49 (try 1)
@@ -148,6 +172,188 @@ int degree(graph *g, int n) {
     return d;
 }
 
+// Failed idea given we start from Cherry's sub-graph.
+// The notion is any linked pair of graphs with less than lower "bound"
+// shared neighbours cannot be part of a clique together.  Therefore their
+// edge can be removed and degree reduced.  Repeat.
+void lower_bound_prune(graph *g, int bound) {
+    int n = g->nnodes;
+
+    int lowest_shared = n;
+    int nd = n/50+.99;
+    for (int i = 0; i < n; i++) {
+	if (i%nd == nd-1)
+	    putchar('.');fflush(stdout);
+	for (int j = i+1; j < n; j++) {
+	    if (!g->conn[i][j])
+		continue;
+//#define PRUNE3  // much too slow
+#ifdef PRUNE3
+	    for (int k = j+1; k < n; k++) {
+		if (!g->conn[i][k] || !g->conn[j][k])
+		    continue;
+		int shared = 2;
+#else
+		int shared = 1;
+#endif
+		for (int z = 0; z < n; z++)
+#ifdef PRUNE3
+		    if (g->conn[i][z] && g->conn[j][z] && g->conn[k][z])
+#else
+		    if (g->conn[i][z] && g->conn[j][z])
+#endif
+			shared++;
+
+		if (lowest_shared > shared)
+		    lowest_shared = shared;
+
+//		printf("%d(%d) %d(%d) %d(%d) shared degree %d\n",
+//		       i, g->degree[i],
+//		       j, g->degree[j],
+//		       k, g->degree[k],
+//		       shared);
+#ifdef PRUNE3
+	    }
+#endif
+	}
+    }
+    printf("\nLowest shared %d\n", lowest_shared);
+
+    exit(0);
+}
+
+void init_graph_degree(graph *g) {
+    int n = g->nnodes;
+    g->degree = (int *)malloc(n * sizeof(*g->degree));
+    int highest_degree = 0;
+    int lowest_degree = g->nnodes;
+    for (int i = 0; i < n; i++) {
+	g->degree[i] = degree(g, i);
+	if (highest_degree < g->degree[i])
+	    highest_degree = g->degree[i];
+	if (lowest_degree  > g->degree[i])
+	    lowest_degree  = g->degree[i];
+    }
+
+    printf("Highest degree: %d\n", highest_degree);
+    printf("Lowest  degree: %d\n", lowest_degree);
+
+//    lower_bound_prune(g, 257);
+
+    // Remove leading diagonal.  It's put in by compat.cpp, but we don't
+    // work well with it.
+    for (int i = 0; i < g->nnodes; i++)
+	g->conn[i][i] = 0;
+
+    // Reduce degree by the degree of things it connects to.
+    // A node with degree 100 has edges to a node with degree 90
+    // means this node can only be in a clique of maximum 99, not 100.
+    // The actual clique size is likely less, but we can use a smaller
+    // upper limit when optimising the order in which to add nodes.
+    for (int i = 0; i < n; i++) {
+	int d = g->degree[i];
+	for (int j = 0; j < n; j++) {
+	    if (g->conn[i][j] && d > g->degree[j])
+		d--;
+	}
+	g->degree[i] = d;
+    }
+
+    // Sort by degree
+    ac_pair p[MAX_CLIQUE];
+    int total_degree = 0;
+// Experimental, but pow of 1 (ie not) seems better.
+#define PPP 1.0
+    for (int i = 0; i < n; i++) {
+	p[i].i1 = i;
+	p[i].i2 = g->degree[i];
+	//total_degree += p[i].i2;
+	total_degree += pow(p[i].i2, PPP);
+    }
+    printf("Total degree = %d\n", total_degree);
+
+    total_degree++;
+    g->random_sz = total_degree;
+    roundup(g->random_sz);
+    double scale = (double)g->random_sz / (total_degree+g->nnodes);
+    g->node_map = (int *)malloc(g->random_sz * sizeof(g->node_map));
+    g->node_map2 = (int *)malloc(g->random_sz * sizeof(g->node_map2));
+
+    qsort(p, n, sizeof(*p), pair_cmp);
+    for (int i = 0; i < n; i++)
+	g->degree_order[i] = p[i].i1;
+
+    // map random value to node number such that high degrees are first.
+    int k, i;
+    for (k = i = 0; i < g->random_sz && k < n; k++) {
+	for (int j = 0;
+	     j < pow(p[k].i2,PPP) * scale && i < g->random_sz;
+	     j++, i++) {
+	    g->node_map[i] = p[k].i1;
+	}
+    }
+    assert(k==n);
+    printf("i=%d random_sz=%d total_degreepow=%d\n", i, g->random_sz, total_degree);
+    while (i < g->random_sz)
+	g->node_map[i++] = p[0].i1;
+//    for (int i = 0; i < g->random_sz; i++) {
+//	printf("%d\t%d\t%d\n", i, g->node_map[i], g->degree[g->node_map[i]]);
+//    }
+
+
+    // Inverse likelihood, with low degrees more frequently found
+    qsort(p, n, sizeof(*p), pair_cmp_rev);
+    for (k = i = 0; i < g->random_sz && k < n; k++) {
+	for (int j = 0;
+	     j < pow(p[k].i2,PPP) * scale && i < g->random_sz;
+	     j++, i++) {
+	    g->node_map2[i] = p[k].i1;
+	}
+    }
+    assert(k==n);
+    while (i < g->random_sz)
+	g->node_map2[i++] = p[0].i1;
+}
+
+void init_graph_neighbours(graph *g) {
+    int n = g->nnodes;
+    g->neighbour_count=(int *)calloc(g->nnodes, sizeof(int));
+    g->neighbour=(int **)calloc(g->nnodes, sizeof(int *));
+
+    ac_pair p[MAX_CLIQUE];
+
+    for (int i = 0; i < n; i++) {
+	int c = 0;
+	for (int j = 0; j < n; j++) {
+	    if (g->conn[i][j])
+		c++;
+	}
+	g->neighbour_count[i] = c;
+	g->neighbour[i] = (int *)calloc(c, sizeof(int));
+
+#if 1
+	for (int j = 0, c = 0; j < n; j++) {
+	    if (g->conn[i][j])
+		g->neighbour[i][c++] = j;
+	}
+#else
+	c = 0;
+	for (int j = 0; j < n; j++) {
+	    if (g->conn[i][j]) {
+		p[c].i1 = j;
+		p[c].i2 = g->degree_order[j];
+		c++;
+	    }
+	}
+	qsort(p, c, sizeof(*p), pair_cmp);
+	for (int j = 0; i < c; i++)
+	    g->neighbour[i][j] = p[j].i1;
+#endif
+
+	
+    }
+}
+
 graph *load_graph(char *fn) {
     FILE *fp = fopen(fn, "r");
     int total_degree = 0;
@@ -170,7 +376,6 @@ graph *load_graph(char *fn) {
 
     g->nnodes = n;
     g->max_possible = n;
-    g->degree = (int *)malloc(n * sizeof(*g->degree));
     g->filtered = (int *)calloc(n, sizeof(*g->filtered));
     g->conn = (char **)calloc(n, sizeof(*g->conn));
     g->weight = (int *)malloc(n * sizeof(*g->weight));
@@ -205,55 +410,8 @@ graph *load_graph(char *fn) {
 	g->weight[n1] = w;
     }
 
-    for (int i = 0; i < n; i++) {
-	g->degree[i] = degree(g, i);
-    }
-
-    // Reduce degree by the degree of things it connects to.
-    // A node with degree 100 has edges to a node with degree 90
-    // means this node can only be in a clique of maximum 99, not 100.
-    // The actual clique size is likely less, but we can use a smaller
-    // upper limit when optimising the order in which to add nodes.
-    for (int i = 0; i < n; i++) {
-	int d = g->degree[i];
-	for (int j = 0; j < n; j++) {
-	    if (g->conn[i][j] && d > g->degree[j])
-		d--;
-	}
-	g->degree[i] = d;
-    }
-
-    // Sort by degree
-    pair p[MAX_CLIQUE];
-    for (int i = 0; i < n; i++) {
-	p[i].i1 = i;
-	p[i].i2 = g->degree[i];
-	total_degree += p[i].i2;
-	//total_degree += pow(p[i].i2, 1.5);
-    }
-
-    g->random_sz = roundup(total_degree);
-    g->node_map = (int *)malloc(g->random_sz * sizeof(g->node_map));
-
-    qsort(p, n, sizeof(*p), pair_cmp);
-    for (int i = 0; i < n; i++)
-	g->degree_order[i] = p[i].i1;
-
-    // map random value to node number such that high degrees are first.
-    int k, i;
-    for (k = i = 0; i < g->random_sz && k < n; k++) {
-	for (int j = 0;
-	     j < p[k].i2 * (g->random_sz/(double)total_degree)
-		 && i < g->random_sz;
-	     j++, i++) {
-	    g->node_map[i] = p[k].i1;
-	}
-    }
-    while (i < g->random_sz)
-	g->node_map[i++] = p[0].i1;
-//    for (int i = 0; i < g->random_sz; i++) {
-//	printf("%d\t%d\t%d\n", i, g->node_map[i], g->degree[g->node_map[i]]);
-//    }
+    init_graph_degree(g);
+    init_graph_neighbours(g);
     
     fclose(fp);
     return g;
@@ -264,8 +422,19 @@ graph *load_graph(char *fn) {
     return NULL;
 }
 
+int random_neighbour(graph *g, int node) {
+    return g->neighbour_count[node]
+	? g->neighbour[node][rand() % g->neighbour_count[node]]
+	: 0;
+}
+
 int random_node(graph *g) {
     return g->node_map[random() % g->random_sz];
+    //return rand() % g->nnodes;
+}
+
+int random_node_low(graph *g) {
+    return g->node_map2[random() % g->random_sz];
     //return rand() % g->nnodes;
 }
 
@@ -275,7 +444,14 @@ void free_graph(graph *g) {
 	    free(g->conn[i]);
 	free(g->conn);
     }
+    if (g->neighbour) {
+	for (int i = 0; i < g->nnodes; i++)
+	    free(g->neighbour[i]);
+	free(g->neighbour);
+	free(g->neighbour_count);
+    }
     free(g->node_map);
+    free(g->node_map2);
     free(g->degree);
     free(g->filtered);
     free(g->weight);
@@ -299,6 +475,7 @@ void filter_graph(graph *g, int degree) {
 
 // A clique is an array of size nnodes of 0 or 1 indicating presence in a clique
 // Test if it forms a clique.
+// Returns 1 if clique, 0 if not.
 int test_clique(graph *g, clique *q) {
     int n = g->nnodes;
 
@@ -326,6 +503,124 @@ int test_clique(graph *g, clique *q) {
     return 1;
 }
 
+// Returns 0 if clique, or a node number if not.
+// The node number is an example failing node.
+int test_clique2(graph *g, clique *q) {
+    int n = g->nnodes;
+
+    // Collapse to used nodes for faster loop below
+    int cnodes[MAX_CLIQUE];
+    int csize = 0;
+    for (int i = 0; i < n; i++) {
+	if (q->used[i])
+	    cnodes[csize++] = i;
+    }
+
+    // randomise cnodes order
+    for (int i = 0; i < csize; i++) {
+	int j = (int)(drand48() * csize);
+	int t = cnodes[i];
+	cnodes[i] = cnodes[j];
+	cnodes[j] = t;
+    }
+
+
+    int worst_csum=0, worst_csum_i=-1;
+
+    // Unrolled version, although there's barely much difference
+    // with clang18 so maybe it's not worth it.
+#if 1
+    // 18124 gcc15
+    for (unsigned int i = 0; i < csize; i++) {
+	int csum2 = 1;
+	char *conn_row = g->conn[cnodes[i]];
+	for (unsigned int j = i+1; j < csize; j++) {
+	    csum2 &= conn_row[cnodes[j]];
+	}
+
+	if (!csum2) {
+	    q->is_clique = 0;
+	    return cnodes[i];
+	}
+    }
+#else
+    // 14764 gcc15
+    // Unroll in i & j.
+    unsigned int i;
+    for (i = 0; i+4 < csize; i+=4) {
+	int csum0 = 1, csum1 = 1, csum2 = 1, csum3 = 1;
+	char *conn_row0 = g->conn[cnodes[i]];
+	char *conn_row1 = g->conn[cnodes[i+1]];
+	char *conn_row2 = g->conn[cnodes[i+2]];
+	char *conn_row3 = g->conn[cnodes[i+3]];
+
+	unsigned int j;
+	for (j= i+1; j<i+4 && j < csize; j++) {
+	                 csum0 &= conn_row0[cnodes[j]];
+	    if (j > i+1) csum1 &= conn_row1[cnodes[j]];
+	    if (j > i+2) csum2 &= conn_row2[cnodes[j]];
+	    if (j > i+3) csum3 &= conn_row3[cnodes[j]];
+	}
+	for (j = i+4; j+4 < csize; j+=4) {
+	    csum0 &= conn_row0[cnodes[j]]
+		  &  conn_row0[cnodes[j+1]]
+		  &  conn_row0[cnodes[j+2]]
+		  &  conn_row0[cnodes[j+3]];
+	    csum1 &= conn_row1[cnodes[j]]
+		  &  conn_row1[cnodes[j+1]]
+		  &  conn_row1[cnodes[j+2]]
+		  &  conn_row1[cnodes[j+3]];
+	    csum2 &= conn_row2[cnodes[j]]
+		  &  conn_row2[cnodes[j+1]]
+		  &  conn_row2[cnodes[j+2]]
+		  &  conn_row2[cnodes[j+3]];
+	    csum3 &= conn_row3[cnodes[j]]
+		  &  conn_row3[cnodes[j+1]]
+		  &  conn_row3[cnodes[j+2]]
+		  &  conn_row3[cnodes[j+3]];
+	}
+	for (; j < csize; j++) {
+	    csum0 &= conn_row0[cnodes[j]];
+	    csum1 &= conn_row1[cnodes[j]];
+	    csum2 &= conn_row2[cnodes[j]];
+	    csum3 &= conn_row3[cnodes[j]];
+	}
+
+	if (!csum0) {
+	    q->is_clique = 0;
+	    return cnodes[i];
+	}
+	if (!csum1) {
+	    q->is_clique = 0;
+	    return cnodes[i+1];
+	}
+	if (!csum2) {
+	    q->is_clique = 0;
+	    return cnodes[i+2];
+	}
+	if (!csum3) {
+	    q->is_clique = 0;
+	    return cnodes[i+3];
+	}
+    }
+    for (; i < csize; i++) {
+	int csum2 = 1;
+	char *conn_row = g->conn[cnodes[i]];
+	for (unsigned int j = i+1; j < csize; j++) {
+	    csum2 &= conn_row[cnodes[j]];
+	}
+
+	if (!csum2) {
+	    q->is_clique = 0;
+	    return cnodes[i];
+	}
+    }
+#endif
+
+    q->is_clique = 1;
+    return 0;
+}
+
 // Clique union
 void merge_clique(graph *g, clique *out, clique *in1, clique *in2) {
     //remove_chash(g, out);
@@ -344,6 +639,21 @@ void merge_clique(graph *g, clique *out, clique *in1, clique *in2) {
 //	add_chash(g, out);
 //    }
 }
+
+
+// Pure intersection only
+void intersect_clique2(graph *g, clique *out, clique *in1, clique *in2) {
+    int n = g->nnodes;
+    for (int i = 0; i < n; i++)
+	out->used[i] = in1->used[i] & in2->used[i];
+
+    out->size = 0;
+    for (int i = 0; i < n; i++)
+	out->size += out->used[i] * g->weight[i];
+
+    //printf("%d x %d => %d, ", in1->size, in2->size, out->size);
+}
+
 
 // Clique intersection
 void intersect_clique(graph *g, clique *out, clique *in1, clique *in2) {
@@ -374,10 +684,10 @@ void intersect_clique(graph *g, clique *out, clique *in1, clique *in2) {
 	int p1, p2;
 	do {
 	    do {
-		p1 = random_node(g);
+		p1 = random_node_low(g);
 	    } while (!out->used[p1]);
 	    
-	    p2 = random_node(g);
+	    p2 = random_node_low(g);
 	} while (p1 == p2 || !g->conn[p1][p2]);
 	out->used[p1] = 1;
 	out->used[p2] = 1;
@@ -397,13 +707,51 @@ void intersect_clique(graph *g, clique *out, clique *in1, clique *in2) {
 void make_clique(graph *g, clique *q) {
     //remove_chash(g, q);
 
-    while (!test_clique(g, q)) {
+    int x;
+    while ((x = test_clique2(g, q))) {
 	int n;
+// random, 10k cycles, 320 pop, p_hat700-1 approx cycles/100 to find clique=11
+// 36 05 44 41 61 xx xx 84 59 36 21 18 15 79 84 xx 49 64 xx 64 xx 33 20 13 / 19
+
+// test_clique2
+// 08 xx 10 21 17 xx 23 15 20 20 xx 16 xx 15 16 08 46 42 20 12 09 16 21 27 / 20
+
+// flat random, pow=1.5
+// 10 10 18 33 xx xx 49 33 44 05 xx 56 51 49 33 23 36 59 05 92 26 xx 56 15 / 21
+
+// flat random, pow=2
+// xx xx xx xx xx 10 18 59 18 41 38 xx xx xx 31 79 xx xx 41 15 xx 26 36 18 / 13
+
+// random_low, pow=1
+// 08 xx 15 xx 23 77 59 xx xx xx xx 20 13 99 08 xx 41 23 44 20 61 xx 49 36 / 16
+
+// random_low, pow=1.5
+// 26 18 13 33 xx xx 26 26 28 20 18 15 xx 31 31 31 xx xx 26 08 31 99 26 xx / 19
+
+// random_low, pow=2
+// xx 20 13 31 15 15 15 10 xx 33 xx 18 41 26 69 20 xx 28 33 26 18 64 xx 46 / 19
+
+// random_high, pow=1.5
+// 20 20 10 54 46 28 05 xx 67 xx 31 54 28 20 77 54 54 15 13 15 xx 18 xx 13 / 21
+
+#if 1
+	n = x;
+#elif 1
+	// Or consider doing both with a "if (rand()&1)" to alternate
+	// ways of choosing nodes.
 	do {
-	    // We want inverse of random_node here, so it's biased to
-	    // low degree.  We don't have it so use a flat distrib instead.
 	    n = rand() % g->nnodes;
 	} while (!q->used[n]);
+#else
+	do {
+	    // high: 282 282 283 283 283 283 283 284 284 285
+	    // flat: 270 271 281 282 282 283 284 284 285 285
+	    // low:  281 283 283 283 283 283 284 284 284 285 
+	    // f/h:  277 281 281 283 283 283 283 284 284 284 alternate
+	    //n = random_node_low(g);
+	    n = random_node(g);
+	} while (!q->used[n]);
+#endif
 
 	int connected = 1;
 	for (int i = 0; i < g->nnodes; i++) {
@@ -473,31 +821,36 @@ void random_clique(graph *g, clique *q, int size) {
     add_chash(g, q);
 }
 
+static int imp_neigh[MAX_CLIQUE];
+static int imp_neigh_cnt;
+static int cnodes[MAX_CLIQUE];
+static int csize;
+
 // Hill climb
 int improve_(graph *g, clique *q, int cycles, double aggressive) {
     int n = g->nnodes;
-    int cnodes[MAX_CLIQUE];
-    int csize = 0;
-    for (int i = 0; i < n; i++) {
-	if (q->used[i])
-	    cnodes[csize++] = i;
-    }
-
-    int p[MAX_CLIQUE];
-    int psize = 0;
-    for (int i = 0; i < n; i++) {
-	if (!q->used[g->degree_order[i]]) {
-	    p[psize] = g->degree_order[i];
-	    psize++;
+    // FIXME: compute in improve() and update each cycle of improve_() instead
+    if (imp_neigh_cnt < 0) {
+	csize = 0;
+	for (int i = 0; i < n; i++) {
+	    if (q->used[i])
+		cnodes[csize++] = i;
 	}
     }
 
-    // 46 46 46 47 47 47 48 48 48 48  base (p[psize] = i, not degree_order)
-    // 48 48 49 49 49 50 50 50 50 50  n/2
-    // 48 49 50 50 50 50 50 50 51 51  n/10
-    // 49 49 49 49 50 50 50 50 50 50  n/20
+    int add = -1;
 
-    if (drand48() > aggressive) {
+    if (drand48() < aggressive) {
+	// OLD improver from aclique.10.c.
+	int p[MAX_CLIQUE];
+	int psize = 0;
+	for (int i = 0; i < n; i++) {
+	    if (!q->used[g->degree_order[i]]) {
+		p[psize] = g->degree_order[i];
+		psize++;
+	    }
+	}
+
 	for (int i = 0; i < n/10; i++) {
 	    int p1 = i;
 	    int p2 = rand() % psize;
@@ -506,40 +859,192 @@ int improve_(graph *g, clique *q, int cycles, double aggressive) {
 	    p[p1] = p[p2];
 	    p[p2] = t;
 	}
-    }
 
-    // Look for a connected node.
-    // TODO: We should be able to AND the entire connection row against
-    // the node numbers and see what's left?
-    // Or at least as a check that *ANY* node connects as a filter.
-    // However good for high csize, but bad for low csize.
-    int add = -1;
-    for (unsigned int i = 0; i < psize; i++) {
-	int connected = 1;
-	char *conn_row = g->conn[p[i]];
-	for (unsigned int j = 0; j < csize; j++) {
-	    if (!conn_row[cnodes[j]]) {
-		connected = 0;
-		break;
+	// Look for a connected node.
+	// TODO: We should be able to AND the entire connection row against
+	// the node numbers and see what's left?
+	// Or at least as a check that *ANY* node connects as a filter.
+	// However good for high csize, but bad for low csize.
+	for (unsigned int i = 0; i < psize; i++) {
+	    int connected = 1;
+	    char *conn_row = g->conn[p[i]];
+	    for (unsigned int j = 0; j < csize; j++) {
+		if (!conn_row[cnodes[j]]) {
+		    connected = 0;
+		    break;
+		}
+	    }
+
+	    if (connected) {
+		//cycles++;
+		q->used[p[i]] = 1;
+		if (!check_chash(g, q)) {
+		    add = p[i];
+		    break;
+		} else {
+		    add = -1;
+		    q->used[p[i]] = 0;
+		}
 	    }
 	}
 
-	if (connected) {
-	    q->used[p[i]] = 1;
-	    if (q->hash == 666) printf("hash=%p %d\n", q, q->hash);
-	    if (!check_chash(g, q)) {
-		add = p[i];
-		break;
-	    } else {
-		add = -1;
-		q->used[p[i]] = 0;
+    } else {
+	// New improver from aclique.11.c.  This is more hill-climbing,
+	// but sometimes hits local maxima
+
+	// Keep a lookup table of all nodes that aren't in q->used but are neighbours
+	// of everything in q->used.  Ie all candidates for increasing clique by 1.
+
+	// DEBUG
+	//    int imp_neigh_X[MAX_CLIQUE], imp_neigh_X_cnt;
+	//    if (imp_neigh_cnt >= 0) {
+	//	memcpy(imp_neigh_X, imp_neigh, imp_neigh_cnt*sizeof(int));
+	//	imp_neigh_X_cnt = imp_neigh_cnt;
+	//	imp_neigh_cnt = -1;
+	//    } else {
+	//	imp_neigh_X_cnt = -1;
+	//    }
+
+	if (imp_neigh_cnt < 0) {
+	    memset(imp_neigh, 0, g->nnodes * sizeof(*imp_neigh));
+	    imp_neigh_cnt = 0;
+	    for (int i = 0; i < g->nnodes; i++) {
+		if (q->used[i])
+		    continue;
+		char *conn_row = g->conn[i];
+		int connected = 1;
+		for (int j = 0; j < csize; j++) {
+		    if (!conn_row[cnodes[j]]) {
+			connected = 0;
+			break;
+		    }
+		}
+		if (connected)
+		    imp_neigh[imp_neigh_cnt++] = i;
 	    }
 	}
+
+	//    if (imp_neigh_X_cnt >= 0) {
+	//	if (imp_neigh_cnt != imp_neigh_X_cnt ||
+	//	    memcmp(imp_neigh_X, imp_neigh, imp_neigh_cnt * sizeof(int)))
+	//	    abort();
+	//    }
+
+	if (imp_neigh_cnt == 0)
+	    return 0;
+
+	// With degree-orient choice: 200 runs in 13m27s
+	// 291 x 74 1.54255 37%
+	// 290 x 99 1.27017 50%
+
+	// With 10k iter 256 pop and random reset adjustments, in 13m56
+	// 291 x 114 2.20731 57%
+	// 290 x 84  1.57241 42%
+	// A bit slower overall, but better hit ratio.
+
+	// With 10k iter 128 pop, in 13m13s (no_gain >= 2000) <<<
+	// 291 x 129 1.44519  65%
+	// 291 x 70  0.837162 35%
+
+	// With 10k iter 128 pop, in 12m5s (no_gain >= 3000) <<<
+	// 291 x 129 1.376850 64%
+	// 290 x  67 0.953453 34%
+
+	// With 10k iter 128 pop, in 11m31s (no_gain >= 4000) <<<
+	// 291 x 126 1.40977  63
+	// 290 x  74 0.770625 37
+
+	// With 10k iter 128 pop, in 11m11s (no_gain >= 5000)
+	// 291 x 118 1.294660 59%
+	// 290 x  79 0.871137 40%
+
+	// With 12k iter 128 pop, in 13m14s
+	// 291 x 125 1.42819 62%
+	// 290 x 75 0.917589 38%
+
+	// With 14k iter 64 pop, in 12m44s
+	// 291 x 102 1.53306 51%
+	// 290 x  94 0.80474 47%
+
+	// With 5k iter 256 pop, in 7m47s
+	// 291 x 67 1.74315  33%
+	// 290 x 131 1.47643 65%
+
+	// ---- aclique.11.c
+	// a11: with 10000i 32p in 15m11s
+	// 291 x 73 1.73196 36%
+	// 290 x 97 1.43204 49%
+
+	// a11: with 10000i 48p in 15m16s <<<<
+	// 291 x 181 1.25394 90%
+	// 290 x  16 1.01864 8%
+
+	// a11: with 10000i 64p in 17m21s <<<
+	// 291 x 176 1.33582 88%
+	// 290 x  24 0.91559 12%
+	//
+	// a11: with 10000i 128p in 29m26s
+	// 291 x 130 3.58043 65%
+	// 290 x  66 2.25658 33%
+
+	// ---- aclique.12.c.  A bit poorer on 291u, but much better on 209u
+	// With 10000i 128p in 21m32s
+	// 291 x  98 2.85465 49%
+	// 290 x 100 1.56793 50%
+	//
+	// With 10000i 96p in 19m9s
+	// 291 x 134 1.96163  67%
+	// 290 x  66 0.922818 33%
+	//
+	// With 10000i 64p in 16m46s <<< (latest at 15m27s)
+	// 291 x 155 1.33804  77%
+	// 290 x  46 0.60152  23%
+	//
+	// With 10000i 48p in 14m25s
+	// 291 x 140 1.22861  70%
+	// 290 x  60 0.553577 30%
+
+	// Pick a random node from imp_neigh and recurse.
+	int max_deg = 0;
+	int max_deg_cnt = 0;
+	int max_deg_arr[MAX_CLIQUE];
+	for (int i = 0; i < imp_neigh_cnt; i++) {
+	    if (max_deg < g->degree[imp_neigh[i]]) {
+		max_deg = g->degree[imp_neigh[i]]; 
+		max_deg_cnt = 0;
+	    }
+	    if (max_deg == g->degree[imp_neigh[i]]) {
+		max_deg_arr[max_deg_cnt++] = imp_neigh[i];
+	    }
+
+	}
+
+	//int add = imp_neigh[rand()%imp_neigh_cnt];
+//	add = drand48() < aggressive           // * 76%/24%; 16m46
+//	    ? imp_neigh[rand()%imp_neigh_cnt]  // L 74%/26%; 16m19
+//	    : max_deg_arr[rand()%max_deg_cnt]; // R 75%/25%; 14m17
+	add = max_deg_arr[rand()%max_deg_cnt];
     }
 
     if (add >= 0) {
+	cnodes[csize++] = add;
 	q->used[add] = 1;
 	q->size+=g->weight[add];
+
+	if (imp_neigh_cnt >= 0) {
+	    // Update imp_neigh lookup table.
+	    // We know everything in it matches cnodes[], but check 'add' too.
+	    int j = 0;
+	    for (int i = 0; i < imp_neigh_cnt; i++) {
+		if (imp_neigh[i] == add)
+		    continue;
+		if (!g->conn[add][imp_neigh[i]])
+		    continue;
+		imp_neigh[j++] = imp_neigh[i];
+	    }
+	    imp_neigh_cnt = j;
+	}
+
 
 	//printf("Add node %d, size %d\n", add, q->size);
 	if (cycles > 0)
@@ -552,11 +1057,14 @@ void improve(graph *g, clique *q, int cycles, int aggressive) {
     remove_chash(g, q);
     //printf("curr=%d ", q->size);
     aggressive |= drand48()<AGGRATE;
+    imp_neigh_cnt = -1; // marker for recalculate the cache.
     int c = improve_(g, q, cycles, aggressive);
     //printf("improved cycles used=%d of %d => %d\n", cycles-c, cycles, q->size);
     add_chash(g, q);
 }
 
+// Mutates by randomly removing nodes and then adding some back again via
+// a few rounds of the improve function.
 void mutate(graph *g, clique *q, int cnt, int aggressive) {
     remove_chash(g, q);
 
@@ -584,9 +1092,29 @@ void mutate(graph *g, clique *q, int cnt, int aggressive) {
     improve(g, q, cnt, aggressive);
 }
 
-#define MAX_BEST 1000
 clique *find_cliques(int population, int niter,
 		     graph *g, int *ncliques, int *top_score) {
+    clock_t start_clock = clock();
+    clock_t best_clock = 0;
+    FILE *outfp = stderr; // for compat stdout gets swallowed up
+
+    if (!niter) {
+	//niter = exp(7+g->nnodes/150.0);
+	niter = MIN(exp(4.5+g->nnodes/100.0),
+		    exp(9.0+g->nnodes/500.0));
+	fprintf(outfp, "Choosing %d iterations\n", niter);
+    }
+
+    int time_growth = 0; // iterations since new max best size
+    int time_member = 0; // iterations since a new member of the current max
+    //printf("GRAPH nnode=%d\n", g->nnodes);
+    //for (int i = 0; i < g->nnodes; i++) {
+    //	printf("GRAPH %d: ", g->weight[i]);
+    //	for (int j=0; j < g->nnodes; j++)
+    //	    putchar('0'+g->conn[i][j]);
+    //	putchar('\n');
+    //}
+
     int best_score = 0;
     static clique best[MAX_BEST];
     int best_hash = 0;
@@ -601,16 +1129,20 @@ clique *find_cliques(int population, int niter,
 	do {
 	    random_clique(g, &pop[i], 2);
 	    //printf("pop %d: %s\n", i, print_clique(g, &pop[i]));
+	    //improve(g, &pop[i], 9999, i < population/10);
 	    improve(g, &pop[i], 9999, i < population/10);
 	} while (!test_clique(g, &pop[i]));
 
-	if (best_score <= pop[i].size) {
+	if (best_score < pop[i].size) {
 	    best_score = pop[i].size;
 	    best_hash = pop[i].hash;
 	    bhash[pop[i].hash & HMASK]++;
 	    best_count = 0;
 	    copy_clique(&best[best_count++], &pop[i]);
-	    fprintf(stderr, "New best clique of size %d\n", best_score);
+	    fprintf(outfp, "New best clique of size %d time %f iter 0\n",
+		    best_score,
+		    (clock() - start_clock)/(double)CLOCKS_PER_SEC);
+	    best_clock = clock();
 	}
     }
     fprintf(stderr, "Done\n");
@@ -620,8 +1152,9 @@ clique *find_cliques(int population, int niter,
     //filter_graph(g, best_score);
 
     // Merge random cliques
-    int no_gain = 0;
+    int no_gain = 0, skip_repop = 0;
     for (int i = 0; i < niter; i++) {
+	time_growth++;
 	if ((i & 0xff) == 0)
 	    fprintf(stderr, "Iter %d / %d\n", i, niter);
 	int p0;
@@ -645,11 +1178,19 @@ clique *find_cliques(int population, int niter,
 	// 
 	//intersect_clique(g, &q, &pop[p1], &pop[p2]);
 
+	//intersect_clique2(g, &q, &pop[p1], &pop[p2]);
+
 	// It's probably not a clique now, so remove things so it is.
 	// 1100.1010: finds 270 in ~2min (try 1)
 	//            finds 270 in ~1min (try 2)
 	make_clique(g, &q);
-	improve_(g, &q, 9999, drand48()<AGGRATE?1:0);
+
+	imp_neigh_cnt = -1; // marker for recalculate the cache.
+	improve_(g, &q, 9999, (drand48()<AGGRATE?1:0) || (p1<population/2 && p2<population/2));
+	//printf("%d\n", q.size);
+	//improve_(g, &q, 9999, drand48()<AGGRATE?1:0);
+
+	//fprintf(stderr, "Merged %d %d to %d\n", pop[p1].size, pop[p2].size, q.size);
 
 	//printf("merged %d(%d) and %d(%d) into %d(%d).  Is_clique=%d %s, present %d, hash %u\n",
 	//       p1, pop[p1].size,
@@ -660,10 +1201,13 @@ clique *find_cliques(int population, int niter,
 	//       chash[q.hash & HMASK],
 	//       q.hash);
 
-	if (best_score < q.size)
+	if (best_score < q.size && q.is_clique)
 	    no_gain = 0;
 	else
 	    no_gain++;
+
+	//if (q.is_clique && q.size == best_score)
+	//    printf("Size %d time_growth=%d\n", q.size, time_growth);
 
 	if (q.is_clique && !check_chash(g, &q)) {
 	    //improve(g, &q, 9999);
@@ -675,9 +1219,15 @@ clique *find_cliques(int population, int niter,
 	    if (best_score <= q.size && best_hash != pop[p0].hash) {
 		if (best_score < q.size) {
 		    best_count = 0;
-		    printf("New best clique of size %d, hash %u, idx %d\n",
-			   q.size, pop[p0].hash, p0);
+		    fprintf(outfp, "New best clique of size %d time %f iter %d\n",
+			    q.size,
+			    (clock() - start_clock)/(double)CLOCKS_PER_SEC,
+			    i);
+		    best_clock = clock();
+
 		    memset(bhash, 0, (HMASK+1)*sizeof(*bhash));
+		    time_growth = 0;
+		    time_member = 0;
 		}
 
 		best_score = q.size;
@@ -689,56 +1239,78 @@ clique *find_cliques(int population, int niter,
 		    //putchar('\n');
 		    bhash[pop[p0].hash & HMASK]++;
 		    copy_clique(&best[best_count++], &pop[p0]);
+		    time_member = 0;
+		} else {
+		    time_member++;
 		}
+		//printf("best_count=%d time_member=%d\n", best_count, time_member);
+	    } else if (best_score == q.size) {
+		time_member++;
 	    }
 
 //	    for (int j = 1; j < population; j++) {
 //		printf("%d: %d %u %d\n", i, j, pop[j].hash, check_chash(g, &pop[j]));
 //	    }
+	} else if (q.is_clique && q.size == best_score) {
+	    time_member++;
 	}
 
+#ifdef BAIL_OUT
+	if (((time_member > BO_TMEMBER || best_count == MAX_BEST)
+	     && time_growth > BO_TGROWTH)
+	    || time_member > BO_TMEMBER2) {
+	    fprintf(outfp, "Terminating with time_member %d and time_growth %d\n",
+		    time_member, time_growth);
+	    break;
+	}
+#endif
+
 #if 1
-	// For 2.1s
-	// if 0  22 22 22 23 23 23 23 23 25 25
-	// P/16  22 22 22 22 22 23 23 24 25 25  cnt=2
-	// P/16  21 22 22 23 23 23 23 23 23 25  cnt=size/8+1
-	// P/16  22 22 22 22 23 23 23 25 25 25  cnt=size/4
-	// P/16  21 22 22 22 22 22 22 22 23 25  cnt=size/4+1
-	// P/16  22 22 22 22 22 22 23 23 23 23  cnt=size/2
-	// P/4   22 22 22 22 23 23 23 25 25 25  cnt=size/8+1
-	// P/2   21 22 22 22 22 24 24 25 25 25  cnt=size/8+1
-	//
-	// P/4   23 23 23 23 23 24 24 24 24 24 (using degree order)
-	for (int i = 0; i < population/4; i++) {
-	    int p;
-	    for (int j = 0; j < 10; j++) {
-		p = rand() % population;
-		if (pop[p].size <= best_score * 0.8)
-		    break;
-	    }
+	for (int i = 0; i < population/16; i++) {
+	    int p = rand() % population;
+//	    for (int j = 0; j < 10; j++) {
+//		p = rand() % population;
+//		if (pop[p].size <= best_score * 0.8)
+//		    break;
+//	    }
 	    //printf("mutate %d (score %d)", p, pop[p].size);
-	    mutate(g, &pop[p], pop[p].size/8+1, i==0);
+	    mutate(g, &pop[p], 8, 1);
+	    //mutate(g, &pop[p], pop[p].size/8+1, i==0);
 	    //printf(" to %d (score %d)\n", p, pop[p].size);
 	}
 #endif
-	
+
+#if 1
 	// TODO (try)
 	// Split into two halfs.
 	// 1st half: merge 1st + 2nd
 	// 2nd half: random new cliques
 
-	if (no_gain >= 1000) {
+	if (no_gain >= 3000) {
 	    // Re-seed and try again
-	    fprintf(stderr, "Reseeding\n");
+	    fprintf(stderr, "Reseeding at iter %d\n", i);
+	    memset(chash, 0, (1<<HSIZE) * sizeof(chash[0]));
 	    for (int i = 0; i < population; i++) {
-		int p = rand() % population;
-		random_clique(g, &pop[p], 2);
-		improve(g, &pop[p], 9999, 0);
+		do {
+		    random_clique(g, &pop[i], 2);
+		    improve(g, &pop[i], 9999, i < population/10);
+		} while (!test_clique(g, &pop[i]));
+		if (best_score < pop[i].size) {
+		    best_hash = pop[i].hash;
+		    bhash[pop[i].hash & HMASK]++;
+		    best_count = 0;
+		    copy_clique(&best[best_count++], &pop[i]);
+		    fprintf(outfp, "New best clique of size %d time %f iter 0\n",
+			    best_score,
+			    (clock() - start_clock)/(double)CLOCKS_PER_SEC);
+		    best_clock = clock();
+		}
 	    }
+	    skip_repop = 1;
 	    no_gain = 0;
 	} else {
 	    // Unimproved small mini cliques for purposes of merging in
-	    for (int i = 0; i < population/2; i++) {
+	    for (int i = 0; i < population/16; i++) {
 		int p;
 		for (int j = 0; j < 10; j++) {
 		    //p = (rand() % (population/2)) + population/2;
@@ -751,6 +1323,7 @@ clique *find_cliques(int population, int niter,
 		//improve(g, &pop[p], 0);
 	    }
 	}
+#endif
 
 #if 0
 	// Adjusted niter for 9.5s
@@ -770,26 +1343,29 @@ clique *find_cliques(int population, int niter,
 		    break;
 	    }
 	    random_clique(g, &pop[p], 2);
-	    improve(g, &pop[p], 9999, i==0);
+	    //improve(g, &pop[p], 9999, i==0);
 	}
 #endif
 	// Keeping the best clique can cause us to end up in a trough.
 	//printf("Update pop[0]\n");
-	remove_chash(g, &pop[0]);
-	copy_clique(&pop[0], &best[0]);
-	add_chash(g, &pop[0]);
+	if (!skip_repop) {
+	    remove_chash(g, &pop[0]);
+	    copy_clique(&pop[0], &best[0]);
+	    add_chash(g, &pop[0]);
 
-	//printf("Update pop[1]\n");
-	remove_chash(g, &pop[1]);
-	copy_clique(&pop[1], &best[MAX(0,MIN(1,best_count-1))]);
-	mutate(g, &pop[1], 2, 1);
-	add_chash(g, &pop[1]);
+	    //printf("Update pop[1]\n");
+	    remove_chash(g, &pop[1]);
+	    copy_clique(&pop[1], &best[MAX(0,MIN(1,best_count-1))]);
+	    mutate(g, &pop[1], 2, 1);
+	    add_chash(g, &pop[1]);
 
-	//printf("Update pop[2]\n");
-	remove_chash(g, &pop[2]);
-	copy_clique(&pop[2], &best[MAX(0,MIN(2,best_count-1))]);
-	mutate(g, &pop[2], 4, 0);
-	add_chash(g, &pop[2]);
+	    //printf("Update pop[2]\n");
+	    remove_chash(g, &pop[2]);
+	    copy_clique(&pop[2], &best[MAX(0,MIN(2,best_count-1))]);
+	    mutate(g, &pop[2], 4, 0);
+	    add_chash(g, &pop[2]);
+	}
+	skip_repop = 0;
 	
 	// p1 + p2 -> p0
     }
@@ -797,9 +1373,17 @@ clique *find_cliques(int population, int niter,
     *ncliques = best_count;
     *top_score = best_score;
 
+    fprintf(outfp, "Finished iterations with time_member %d and time_growth %d\n",
+	    time_member, time_growth);
+    fprintf(outfp, "Found %d cliques with best score %d first_time %f total time %f\n",
+	    best_count, best_score,
+	    (best_clock - start_clock)/(double)CLOCKS_PER_SEC,
+	    (clock() - start_clock)/(double)CLOCKS_PER_SEC);
+
     return best;
 }
 
+#ifndef NO_ACLIQUE_MAIN
 int main(int argc, char **argv) {
     //srand(0);
     srand(time(NULL) + clock());
@@ -810,14 +1394,26 @@ int main(int argc, char **argv) {
     srand(v);
     srand48(rand());
 
-    if (argc == 1) {
-	fprintf(stderr, "Usage: aclique filename.clq\n");
+    if (argc < 2) {
+	fprintf(stderr, "Usage: aclique filename.clq [niter [population]]\n");
 	exit(1);
     }
 
+    int niter = NITER;
+    if (argc > 2)
+	niter=atoi(argv[2]);
+
+    int population = POPULATION;
+    if (argc > 3)
+	population=atoi(argv[3]);
+
+    int fin_pop = 10;
+
+    printf("Population %d, niter %d\n", population, niter);
+
     graph *g = load_graph(argv[1]);
     int nclique = 0, best_score = 0;
-    clique *clique = find_cliques(POPULATION, NITER, g, &nclique, &best_score);
+    clique *clique = find_cliques(population, niter, /*fin_pop,*/ g, &nclique, &best_score);
 
     // TODO: keep an array of best cliques
     printf("Returned %d cliques of size %d\n", nclique, best_score);
@@ -833,3 +1429,4 @@ int main(int argc, char **argv) {
 
     return 0;
 }
+#endif
