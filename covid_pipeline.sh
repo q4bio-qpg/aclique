@@ -134,6 +134,23 @@ do
     tail -1 $t.rfdist
     $QDIR/tree_score3lin.pl $t | tail -1 > $t.score
 
+    echo ":- Running compat-1024 $compat_args $aligned"
+    /usr/bin/time -f "$time_fmt" sh -c "eval compat-jkb.sh $compat_args $aligned $aligned.compat-1024.nwk 2>&1 | zstd -9 > $aligned.compat-1024.out.zstd"
+
+    echo ":- Evaluating compat-1024 tree"
+    t=$aligned.compat-1024.nwk
+    iqtree3 -rf lineage.nwk $t >/dev/null
+    tail -1 $t.rfdist
+    $QDIR/tree_score3lin.pl $t | tail -1 > $t.score
+
+    echo ":- Running compat-approx-100,50 $compat_args $aligned"
+    COMPAT_APPROX=100,50 /usr/bin/time -f "$time_fmt" sh -c "eval compat-jkb.sh $compat_args $aligned $aligned.compat-approx.nwk 2>&1 | zstd -9 > $aligned.compat-approx.out.zstd"
+
+    echo ":- Evaluating compat-approx tree"
+    t=$aligned.compat-approx.nwk
+    iqtree3 -rf lineage.nwk $t >/dev/null
+    tail -1 $t.rfdist
+    $QDIR/tree_score3lin.pl $t | tail -1 > $t.score
 
 #     #--- Build tree with compat
 #     time_fmt='Elapsed %e %E\nCPU     %U\nSystem  %S\nMax RSS %M KB'

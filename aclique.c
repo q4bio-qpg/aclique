@@ -16,6 +16,9 @@
 #include <time.h>
 #include <math.h>
 #include <assert.h>
+#include <limits.h>
+
+static int time_limit = INT_MAX; // in seconds
 
 #ifndef MAX_CLIQUE
 #  define MAX_CLIQUE 10000
@@ -1248,7 +1251,7 @@ void mutate(graph *g, clique *q, int cnt, int aggressive) {
     improve(g, q, cnt, aggressive);
 }
 
-clique *find_cliques(int population, int niter,
+clique *find_cliques(int population, int niter, int time_limit,
 		     graph *g, int *ncliques, int *top_score) {
     clock_t start_clock = clock();
     clock_t best_clock = 0;
@@ -1311,6 +1314,9 @@ clique *find_cliques(int population, int niter,
     // Merge random cliques
     int no_gain = 0, skip_repop = 0, iter_end = niter;
     for (int i = 0; i < niter; i++) {
+	if ((clock() - start_clock) /(double)CLOCKS_PER_SEC > time_limit)
+	    break;
+
 	time_growth++;
 	time_member++;
 	if ((i & 0xff) == 0)
@@ -1556,24 +1562,38 @@ clique *find_cliques(int population, int niter,
 }
 
 #ifndef NO_ACLIQUE_MAIN
+static void usage(FILE *fp) {
+    fprintf(fp, "Usage: aclique filename.clq [-s seed] [-t timeout] [niter [population]]\n");
+    exit(fp == stderr);
+}
+
 int main(int argc, char **argv) {
     //srand(0);
     srand(time(NULL) + clock());
     int v = rand();
+    if (argc < 2)
+	usage(stdout);
+
     char *fn = argv[1];
-    if (argc > 3 && strcmp(argv[2], "-s") == 0) {
-	v = atoi(argv[3]);
-	argc-=2;
-	argv+=2;
+    if (strcmp(fn, "-h") == 0)
+	usage(stdout);
+
+    while (argc > 2 && argv[2][0] == '-') {
+	if (argc > 3 && strcmp(argv[2], "-s") == 0) {
+	    v = atoi(argv[3]);
+	    argc-=2;
+	    argv+=2;
+	} else if (argc > 3 && strcmp(argv[2], "-t") == 0) {
+	    time_limit = atoi(argv[3]);
+	    argc-=2;
+	    argv+=2;
+	} else {
+	    usage(stderr);
+	}
     }
     printf("RAND %d\n", v);
     srand(v);
     srand48(rand());
-
-    if (argc < 2) {
-	fprintf(stderr, "Usage: aclique [-s seed] filename.clq [niter [population]]\n");
-	exit(1);
-    }
 
     int niter = NITER;
     if (argc > 2)
@@ -1588,8 +1608,12 @@ int main(int argc, char **argv) {
     printf("Population %d, niter %d\n", population, niter);
 
     graph *g = load_graph(fn);
+    if (!g)
+	exit(1);
+
     int nclique = 0, best_score = 0;
-    clique *clique = find_cliques(population, niter, /*fin_pop,*/ g, &nclique, &best_score);
+    clique *clique = find_cliques(population, niter, time_limit,
+				  /*fin_pop,*/ g, &nclique, &best_score);
 
     // TODO: keep an array of best cliques
     printf("Returned %d cliques of size %d\n", nclique, best_score);
